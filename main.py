@@ -25,7 +25,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-coder:480b-cloud")
 # ============================================================
 # Which system prompt file to load (relative to this script).
 # Try e.g. "system.txt" or "system_prompts/realone.txt".
-SYSTEM_PROMPT_FILE = "system_prompts/racist.txt"
+SYSTEM_PROMPT_FILE = "system_prompts/malay_aggressive.txt"
 
 # Append the Malay slang reference (system_prompts/malay_slang.txt)?
 USE_MALAY_SLANG = False
@@ -166,11 +166,15 @@ _pending: dict[tuple[str, int], list[tuple[float, str]]] = {}
 _pending_tasks: dict[tuple[str, int], asyncio.Task] = {}
 _typing_until: dict[tuple[str, int], float] = {}
 
+# User ids the bot is "baited" on: it replies to everything they say. In-memory only.
+_baited: set[int] = set()
+
 # ---
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 
 # Event loop handle, set in on_ready, used by the console thread to apply changes safely.
 _loop: asyncio.AbstractEventLoop | None = None
@@ -208,10 +212,36 @@ async def generate_response(
     return reply
 
 
+@tree.command(name="bait", description="Make the bot always respond to a user")
+@discord.app_commands.describe(user="The user to always respond to")
+async def bait(interaction: discord.Interaction, user: discord.User):
+    _baited.add(user.id)
+    await interaction.response.send_message(
+        f"now baiting {user.mention} — i'll respond to everything they say", ephemeral=True
+    )
+
+
+@tree.command(name="unbait", description="Stop always responding to a user")
+@discord.app_commands.describe(user="The user to stop responding to")
+async def unbait(interaction: discord.Interaction, user: discord.User):
+    _baited.discard(user.id)
+    await interaction.response.send_message(
+        f"stopped baiting {user.mention}", ephemeral=True
+    )
+
+
 @client.event
 async def on_ready():
     global _loop
     _loop = asyncio.get_running_loop()
+    # Register slash commands instantly in every connected server.
+    try:
+        for guild in client.guilds:
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+        print(f"Synced slash commands to {len(client.guilds)} server(s)")
+    except Exception as e:
+        print(f"Slash command sync failed: {e}")
     print(f"Logged in as {client.user} (ID: {client.user.id})")
     print("Console ready. Type 'help' for commands.")
 
@@ -300,7 +330,8 @@ async def on_message(message: discord.Message):
         and isinstance(message.reference.resolved, discord.Message)
         and message.reference.resolved.author == client.user
     )
-    forced = is_mention or is_reply_to_bot
+    # Baited users always get a response, like a standing mention.
+    forced = is_mention or is_reply_to_bot or author_id in _baited
 
     # Awareness: keep replying to the person who pulled us in, until the window lapses
     aware_user, aware_until = _aware.get(channel_id, (None, 0.0))
