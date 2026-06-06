@@ -25,10 +25,15 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-coder:480b-cloud")
 # ============================================================
 # Which system prompt file to load (relative to this script).
 # Try e.g. "system.txt" or "system_prompts/realone.txt".
-SYSTEM_PROMPT_FILE = "system_prompts/malay_system.txt"
+SYSTEM_PROMPT_FILE = "system_prompts/racist.txt"
 
 # Append the Malay slang reference (system_prompts/malay_slang.txt)?
-USE_MALAY_SLANG = True
+USE_MALAY_SLANG = False
+
+# Instant mode: reply immediately whenever the bot is mentioned or replied to, with
+# NO awareness window, NO burst-merging, and NO debounce wait. When True, the four
+# timing settings below are ignored.
+INSTANT_MODE = True
 
 # After someone mentions/replies to the bot, it stays "aware" in that channel
 # for this many seconds and keeps replying to THAT person without needing another
@@ -211,23 +216,10 @@ async def on_ready():
     print("Console ready. Type 'help' for commands.")
 
 
-async def _respond_when_done(pkey: tuple[str, int], message: discord.Message, is_mention: bool) -> None:
-    """Wait until the person has stopped sending messages, then reply to the whole burst."""
-    try:
-        # Wait for a quiet gap; keep waiting while they're still typing.
-        while True:
-            await asyncio.sleep(RESPONSE_DEBOUNCE_SECONDS)
-            if time.monotonic() >= _typing_until.get(pkey, 0.0):
-                break
-    except asyncio.CancelledError:
-        return
-
-    _pending_tasks.pop(pkey, None)
-    _typing_until.pop(pkey, None)
-    channel_id, author_id = pkey
-
-    # Merge the person's recent un-answered lines into one prompt, then consume them.
-    merged = "\n".join(txt for (_, txt) in _pending.pop(pkey, []))
+async def _do_reply(message: discord.Message, is_mention: bool, merged: str) -> None:
+    """Build the prompt from `merged`, generate a reply, and send it."""
+    channel_id = str(message.channel.id)
+    author_id = message.author.id
 
     # Prepend replied-to message as context for this turn
     prompt_content = merged
@@ -261,9 +253,28 @@ async def _respond_when_done(pkey: tuple[str, int], message: discord.Message, is
     else:
         await message.channel.send(reply)
 
-    # Open / slide the awareness window for this person in this channel
-    if AWARENESS_SECONDS > 0:
+    # Open / slide the awareness window (skipped in instant mode)
+    if not INSTANT_MODE and AWARENESS_SECONDS > 0:
         _aware[channel_id] = (author_id, time.monotonic() + AWARENESS_SECONDS)
+
+
+async def _respond_when_done(pkey: tuple[str, int], message: discord.Message, is_mention: bool) -> None:
+    """Wait until the person has stopped sending messages, then reply to the whole burst."""
+    try:
+        # Wait for a quiet gap; keep waiting while they're still typing.
+        while True:
+            await asyncio.sleep(RESPONSE_DEBOUNCE_SECONDS)
+            if time.monotonic() >= _typing_until.get(pkey, 0.0):
+                break
+    except asyncio.CancelledError:
+        return
+
+    _pending_tasks.pop(pkey, None)
+    _typing_until.pop(pkey, None)
+
+    # Merge the person's recent un-answered lines into one prompt, then consume them.
+    merged = "\n".join(txt for (_, txt) in _pending.pop(pkey, []))
+    await _do_reply(message, is_mention, merged)
 
 
 @client.event
@@ -309,6 +320,12 @@ async def on_message(message: discord.Message):
     if content:
         buf = _channel_context.setdefault(channel_id, deque(maxlen=_CHANNEL_CONTEXT_MAX))
         buf.append(f"{message.author.display_name}: {content}")
+
+    # Instant mode: reply right away if addressed, skipping awareness/merge/debounce.
+    if INSTANT_MODE:
+        if forced:
+            await _do_reply(message, is_mention, content)
+        return
 
     # Accumulate this person's recent lines so a burst of messages can be merged.
     now = time.monotonic()
