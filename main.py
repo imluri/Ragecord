@@ -398,6 +398,16 @@ def _reset_all() -> None:
     print("reset all conversations")
 
 
+def _bait_user(user_id: int) -> None:
+    _baited.add(user_id)
+    print(f"now baiting user {user_id}")
+
+
+def _unbait_user(user_id: int) -> None:
+    _baited.discard(user_id)
+    print(f"stopped baiting user {user_id}")
+
+
 def _schedule(fn) -> None:
     """Run a state-mutating function on the bot's event loop thread."""
     if _loop is None:
@@ -412,6 +422,9 @@ def _print_help() -> None:
         "  list                 show stored conversations (user id -> message count)\n"
         "  reset <user_id>      clear one user's conversation + awareness\n"
         "  reset all            clear every conversation\n"
+        "  bait <user_id>       always respond to this user\n"
+        "  unbait <user_id>     stop always responding to this user\n"
+        "  baited               list baited user ids\n"
         "  help                 show this help"
     )
 
@@ -441,6 +454,17 @@ def _console_loop() -> None:
                 _schedule(_reset_all)
             else:
                 _schedule(lambda uid=args[0]: _reset_user(uid))
+        elif cmd in ("bait", "unbait"):
+            if not args:
+                print(f"usage: {cmd} <user_id>")
+            elif not args[0].isdigit():
+                print(f"user id must be a number, got '{args[0]}'")
+            else:
+                fn = _bait_user if cmd == "bait" else _unbait_user
+                _schedule(lambda uid=int(args[0]): fn(uid))
+        elif cmd == "baited":
+            ids = sorted(_baited)
+            print("  " + ", ".join(str(i) for i in ids) if ids else "(none baited)")
         else:
             print(f"unknown command: {cmd}  (try 'help')")
 
