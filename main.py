@@ -20,7 +20,7 @@ DISCORD_TOKEN = os.getenv("TOKEN")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-coder:480b-cloud")
 
-SYSTEM_PROMPT_FILE = "system_prompts/malay_aggressive.txt"
+SYSTEM_PROMPT_FILE = "system_prompts/racist.txt"
 INSTANT_MODE = True
 AWARENESS_SECONDS = 90
 MESSAGE_MERGE_SECONDS = 45
