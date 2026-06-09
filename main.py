@@ -27,6 +27,11 @@ MESSAGE_MERGE_SECONDS = 45
 RESPONSE_DEBOUNCE_SECONDS = 3
 TYPING_PATIENCE_SECONDS = 8
 
+# Message-search tool: how many messages to scan per registered channel, and how
+# many matches to hand back to the model.
+SEARCH_HISTORY_LIMIT = 300
+SEARCH_MAX_RESULTS = 15
+
 
 def _ollama_base():
     return OLLAMA_BASE_URL.removesuffix("/v1").removesuffix("/")
@@ -86,7 +91,30 @@ def _save_conversations(convs):
         json.dump(convs, f)
 
 
+# Per-server list of channels the search tool is allowed to look through.
+_SEARCH_FILE = os.path.join(os.path.dirname(__file__), "search_channels.json")
+
+
+def _load_search_channels():
+    if not os.path.exists(_SEARCH_FILE):
+        return {}
+    try:
+        with open(_SEARCH_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {gid: set(ids) for gid, ids in raw.items()}
+
+
+def _save_search_channels():
+    with open(_SEARCH_FILE, "w", encoding="utf-8") as f:
+        json.dump({gid: sorted(ids) for gid, ids in _search_channels.items()}, f)
+
+
 _conversations: dict[str, list] = _load_conversations()
+_search_channels: dict[str, set[int]] = _load_search_channels()
+# Awareness: channel_id -> (user_id the bot is engaged with, monotonic deadline).
+# While active, the bot keeps replying to THAT person without needing a mention.
 _aware: dict[str, tuple[int, float]] = {}
 _CHANNEL_CONTEXT_MAX = 8
 _channel_context: dict[str, deque] = {}
@@ -102,7 +130,64 @@ client = discord.Bot(intents=intents)  # py-cord uses discord.Bot
 _loop: asyncio.AbstractEventLoop | None = None
 
 
-async def generate_response(user_id, user_content, context, turn_hint=None):
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_messages",
+        "description": (
+            "Search what members have said before, in this server's registered channels. "
+            "Use it to dig up or reference something a user said previously. "
+            "Returns matching past messages, newest first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "keyword or phrase to look for"},
+                "user": {"type": "string", "description": "display name of the member to limit to (optional)"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+TOOLS = [SEARCH_TOOL]
+
+
+async def _run_search_tool(message: discord.Message, args: dict) -> str:
+    guild = message.guild
+    if guild is None:
+        return "search not available outside a server"
+    chan_ids = _search_channels.get(str(guild.id), set())
+    if not chan_ids:
+        return "no channels are registered for search on this server (use /search_add)"
+
+    query = (args.get("query") or "").strip().lower()
+    user_name = (args.get("user") or "").strip().lower()
+
+    matches = []
+    for cid in list(chan_ids):
+        ch = guild.get_channel(cid)
+        if ch is None:
+            continue
+        try:
+            async for m in ch.history(limit=SEARCH_HISTORY_LIMIT):
+                if m.author.bot or not m.content:
+                    continue
+                if user_name and user_name not in m.author.display_name.lower():
+                    continue
+                if query and query not in m.content.lower():
+                    continue
+                matches.append(f"{m.author.display_name}: {m.content}")
+                if len(matches) >= SEARCH_MAX_RESULTS:
+                    break
+        except discord.Forbidden:
+            continue
+        if len(matches) >= SEARCH_MAX_RESULTS:
+            break
+
+    return "\n".join(matches) if matches else "no matching messages found"
+
+
+async def generate_response(user_id, user_content, context, turn_hint=None, message=None):
     history = _conversations.setdefault(user_id, [])
     history.append({"role": "user", "content": user_content})
 
@@ -119,8 +204,40 @@ async def generate_response(user_id, user_content, context, turn_hint=None):
         messages.append({"role": "system", "content": turn_hint})
     messages += history
 
-    response = ollama.chat.completions.create(model=OLLAMA_MODEL, messages=messages)
-    reply = " ".join(response.choices[0].message.content.split())
+    # Let the model call the search tool (only when we have a message to search from).
+    use_tools = {"tools": TOOLS} if message is not None else {}
+    response = ollama.chat.completions.create(model=OLLAMA_MODEL, messages=messages, **use_tools)
+    choice = response.choices[0].message
+
+    rounds = 0
+    while message is not None and choice.tool_calls and rounds < 3:
+        messages.append({
+            "role": "assistant",
+            "content": choice.content or "",
+            "tool_calls": [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in choice.tool_calls
+            ],
+        })
+        for tc in choice.tool_calls:
+            try:
+                tool_args = json.loads(tc.function.arguments or "{}")
+            except ValueError:
+                tool_args = {}
+            result = (await _run_search_tool(message, tool_args)
+                      if tc.function.name == "search_messages" else "unknown tool")
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+        response = ollama.chat.completions.create(model=OLLAMA_MODEL, messages=messages, tools=TOOLS)
+        choice = response.choices[0].message
+        rounds += 1
+
+    reply = " ".join((choice.content or "").split())
+    # If the model stalled on tool calls without a final answer, force one without tools.
+    if not reply:
+        response = ollama.chat.completions.create(model=OLLAMA_MODEL, messages=messages)
+        reply = " ".join((response.choices[0].message.content or "").split())
 
     history.append({"role": "assistant", "content": reply})
     _save_conversations(_conversations)
@@ -138,6 +255,40 @@ async def bait(ctx: discord.ApplicationContext, user: discord.User):
 async def unbait(ctx: discord.ApplicationContext, user: discord.User):
     _baited.discard(user.id)
     await ctx.respond(f"stopped baiting {user.mention}", ephemeral=True)
+
+
+@client.slash_command(name="search_add", description="Let the bot search this (or a given) channel on this server")
+async def search_add(ctx: discord.ApplicationContext, channel: discord.TextChannel = None):
+    if ctx.guild is None:
+        await ctx.respond("this only works in a server", ephemeral=True)
+        return
+    channel = channel or ctx.channel
+    _search_channels.setdefault(str(ctx.guild.id), set()).add(channel.id)
+    _save_search_channels()
+    await ctx.respond(f"added {channel.mention} to the search list", ephemeral=True)
+
+
+@client.slash_command(name="search_remove", description="Stop the bot from searching a channel")
+async def search_remove(ctx: discord.ApplicationContext, channel: discord.TextChannel = None):
+    if ctx.guild is None:
+        await ctx.respond("this only works in a server", ephemeral=True)
+        return
+    channel = channel or ctx.channel
+    _search_channels.get(str(ctx.guild.id), set()).discard(channel.id)
+    _save_search_channels()
+    await ctx.respond(f"removed {channel.mention} from the search list", ephemeral=True)
+
+
+@client.slash_command(name="search_list", description="Show which channels the bot can search on this server")
+async def search_list(ctx: discord.ApplicationContext):
+    if ctx.guild is None:
+        await ctx.respond("this only works in a server", ephemeral=True)
+        return
+    ids = _search_channels.get(str(ctx.guild.id), set())
+    if not ids:
+        await ctx.respond("no channels registered — use /search_add", ephemeral=True)
+        return
+    await ctx.respond("searching: " + ", ".join(f"<#{cid}>" for cid in ids), ephemeral=True)
 
 
 @client.event
@@ -170,7 +321,7 @@ async def _do_reply(message: discord.Message, is_mention: bool, merged: str):
     context_snapshot = list(_channel_context.get(channel_id, []))
 
     async with message.channel.typing():
-        reply = await generate_response(str(author_id), prompt_content, context_snapshot, turn_hint)
+        reply = await generate_response(str(author_id), prompt_content, context_snapshot, turn_hint, message)
 
     if len(reply) > 2000:
         reply = reply[:1997] + "..."
@@ -230,9 +381,13 @@ async def on_message(message: discord.Message):
         and time.monotonic() < aware_until
     )
 
+    # Resolve mentions so the AI understands the conversation: drop the bot's own
+    # mention (it's just the trigger), but turn mentions of other members into their
+    # names (e.g. "@ava") so it knows who is being talked about.
     content = message.content
-    for mention in message.mentions:
-        content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+    for m in message.mentions:
+        name = "" if m == client.user else f"@{m.display_name}"
+        content = content.replace(f"<@{m.id}>", name).replace(f"<@!{m.id}>", name)
     content = content.strip()
 
     if content:
