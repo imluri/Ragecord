@@ -20,7 +20,7 @@ DISCORD_TOKEN = os.getenv("TOKEN")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-coder:480b-cloud")
 
-SYSTEM_PROMPT_FILE = "system_prompts/racist.txt"
+SYSTEM_PROMPT_FILE = "system_prompts/realone.txt"
 INSTANT_MODE = True
 AWARENESS_SECONDS = 90
 MESSAGE_MERGE_SECONDS = 45
@@ -31,6 +31,9 @@ TYPING_PATIENCE_SECONDS = 8
 # many matches to hand back to the model.
 SEARCH_HISTORY_LIMIT = 300
 SEARCH_MAX_RESULTS = 15
+
+# Only this Discord user id may run the slash commands.
+OWNER_ID = 640556322194063434
 
 
 def _ollama_base():
@@ -111,6 +114,25 @@ def _save_search_channels():
         json.dump({gid: sorted(ids) for gid, ids in _search_channels.items()}, f)
 
 
+# Channels the bot always replies in — remembered across restarts.
+_BAIT_FILE = os.path.join(os.path.dirname(__file__), "bait_channels.json")
+
+
+def _load_bait_channels():
+    if not os.path.exists(_BAIT_FILE):
+        return set()
+    try:
+        with open(_BAIT_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_bait_channels():
+    with open(_BAIT_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(_bait_channels), f)
+
+
 _conversations: dict[str, list] = _load_conversations()
 _search_channels: dict[str, set[int]] = _load_search_channels()
 # Awareness: channel_id -> (user_id the bot is engaged with, monotonic deadline).
@@ -122,6 +144,7 @@ _pending: dict[tuple[str, int], list[tuple[float, str]]] = {}
 _pending_tasks: dict[tuple[str, int], asyncio.Task] = {}
 _typing_until: dict[tuple[str, int], float] = {}
 _baited: set[int] = set()
+_bait_channels: set[int] = _load_bait_channels()  # channel ids where the bot replies to everyone
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -244,21 +267,55 @@ async def generate_response(user_id, user_content, context, turn_hint=None, mess
     return reply
 
 
-# py-cord slash commands use @client.slash_command
+# py-cord slash commands use @client.slash_command. Every command is owner-only:
+# call this first and bail if it returns True.
+async def _deny_if_not_owner(ctx: discord.ApplicationContext) -> bool:
+    if ctx.author.id != OWNER_ID:
+        await ctx.respond("you can't use this", ephemeral=True)
+        return True
+    return False
+
+
 @client.slash_command(name="bait", description="Make the bot always respond to a user")
 async def bait(ctx: discord.ApplicationContext, user: discord.User):
+    if await _deny_if_not_owner(ctx):
+        return
     _baited.add(user.id)
     await ctx.respond(f"now baiting {user.mention} — i'll respond to everything they say", ephemeral=True)
 
 
 @client.slash_command(name="unbait", description="Stop always responding to a user")
 async def unbait(ctx: discord.ApplicationContext, user: discord.User):
+    if await _deny_if_not_owner(ctx):
+        return
     _baited.discard(user.id)
     await ctx.respond(f"stopped baiting {user.mention}", ephemeral=True)
 
 
+@client.slash_command(name="bait_channel", description="Make the bot always respond to everyone in a channel")
+async def bait_channel(ctx: discord.ApplicationContext, channel: discord.TextChannel = None):
+    if await _deny_if_not_owner(ctx):
+        return
+    channel = channel or ctx.channel
+    _bait_channels.add(channel.id)
+    _save_bait_channels()
+    await ctx.respond(f"now always responding in {channel.mention}", ephemeral=True)
+
+
+@client.slash_command(name="unbait_channel", description="Stop always responding in a channel")
+async def unbait_channel(ctx: discord.ApplicationContext, channel: discord.TextChannel = None):
+    if await _deny_if_not_owner(ctx):
+        return
+    channel = channel or ctx.channel
+    _bait_channels.discard(channel.id)
+    _save_bait_channels()
+    await ctx.respond(f"stopped always responding in {channel.mention}", ephemeral=True)
+
+
 @client.slash_command(name="search_add", description="Let the bot search this (or a given) channel on this server")
 async def search_add(ctx: discord.ApplicationContext, channel: discord.TextChannel = None):
+    if await _deny_if_not_owner(ctx):
+        return
     if ctx.guild is None:
         await ctx.respond("this only works in a server", ephemeral=True)
         return
@@ -270,6 +327,8 @@ async def search_add(ctx: discord.ApplicationContext, channel: discord.TextChann
 
 @client.slash_command(name="search_remove", description="Stop the bot from searching a channel")
 async def search_remove(ctx: discord.ApplicationContext, channel: discord.TextChannel = None):
+    if await _deny_if_not_owner(ctx):
+        return
     if ctx.guild is None:
         await ctx.respond("this only works in a server", ephemeral=True)
         return
@@ -281,6 +340,8 @@ async def search_remove(ctx: discord.ApplicationContext, channel: discord.TextCh
 
 @client.slash_command(name="search_list", description="Show which channels the bot can search on this server")
 async def search_list(ctx: discord.ApplicationContext):
+    if await _deny_if_not_owner(ctx):
+        return
     if ctx.guild is None:
         await ctx.respond("this only works in a server", ephemeral=True)
         return
@@ -299,6 +360,19 @@ async def on_ready():
     print("Console ready. Type 'help' for commands.")
 
 
+def _resolve_mentions(msg: discord.Message, drop_bot: bool = False) -> str:
+    """Turn raw <@id>/<#id>/<@&id> tokens into readable @name / #channel names."""
+    text = msg.content
+    for u in msg.mentions:
+        name = "" if (drop_bot and u == client.user) else f"@{u.display_name}"
+        text = text.replace(f"<@{u.id}>", name).replace(f"<@!{u.id}>", name)
+    for ch in msg.channel_mentions:
+        text = text.replace(f"<#{ch.id}>", f"#{ch.name}")
+    for role in msg.role_mentions:
+        text = text.replace(f"<@&{role.id}>", f"@{role.name}")
+    return text.strip()
+
+
 async def _do_reply(message: discord.Message, is_mention: bool, merged: str):
     channel_id = str(message.channel.id)
     author_id = message.author.id
@@ -307,7 +381,8 @@ async def _do_reply(message: discord.Message, is_mention: bool, merged: str):
     if message.reference and message.reference.resolved:
         resolved = message.reference.resolved
         if isinstance(resolved, discord.Message) and resolved.content:
-            prompt_content = f"[Replying to: \"{resolved.content}\"]\n\n{merged}".strip()
+            quoted = _resolve_mentions(resolved)
+            prompt_content = f"[Replying to {resolved.author.display_name}: \"{quoted}\"]\n\n{merged}".strip()
 
     turn_hint = None
     if not prompt_content:
@@ -372,7 +447,12 @@ async def on_message(message: discord.Message):
         and isinstance(message.reference.resolved, discord.Message)
         and message.reference.resolved.author == client.user
     )
-    forced = is_mention or is_reply_to_bot or author_id in _baited
+    forced = (
+        is_mention
+        or is_reply_to_bot
+        or author_id in _baited
+        or message.channel.id in _bait_channels
+    )
 
     aware_user, aware_until = _aware.get(channel_id, (None, 0.0))
     aware = (
@@ -382,13 +462,9 @@ async def on_message(message: discord.Message):
     )
 
     # Resolve mentions so the AI understands the conversation: drop the bot's own
-    # mention (it's just the trigger), but turn mentions of other members into their
-    # names (e.g. "@ava") so it knows who is being talked about.
-    content = message.content
-    for m in message.mentions:
-        name = "" if m == client.user else f"@{m.display_name}"
-        content = content.replace(f"<@{m.id}>", name).replace(f"<@!{m.id}>", name)
-    content = content.strip()
+    # mention (it's just the trigger), but turn other members, channels, and roles
+    # into readable names (e.g. "@ava", "#general") so it knows who/what is referenced.
+    content = _resolve_mentions(message, drop_bot=True)
 
     if content:
         buf = _channel_context.setdefault(channel_id, deque(maxlen=_CHANNEL_CONTEXT_MAX))
